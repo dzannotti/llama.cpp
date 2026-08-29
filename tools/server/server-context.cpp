@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -36,6 +37,168 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Sidecar written beside a slot save file.
+//
+// llama_state_seq_save_file carries the target KV and the token list, but not the
+// context checkpoints and not the draft context. Without the checkpoints a restored
+// slot has nothing to rewind through, so update_slots() takes the do_reset path and
+// reprocesses the whole prompt -- which is why slot restore is a no-op on SWA and
+// hybrid/recurrent models. The in-RAM prompt cache does not have this problem because
+// server_prompt_cache_state carries prompt.checkpoints and the draft blob alongside
+// the main state; this brings the on-disk path up to parity.
+//
+// A missing or unreadable sidecar is not an error: the slot restores exactly as it did
+// before, and the caller is warned that the next request will reprocess in full.
+
+static const char     SLOT_AUX_MAGIC[4] = { 'L', 'S', 'A', 'X' };
+static const uint32_t SLOT_AUX_VERSION  = 1;
+
+static std::string slot_aux_path(const std::string & filepath) {
+    return filepath + ".aux";
+}
+
+template <typename T> static void slot_aux_put(std::ostream & os, const T & v) {
+    os.write(reinterpret_cast<const char *>(&v), sizeof(T));
+}
+
+template <typename T> static bool slot_aux_get(std::istream & is, T & v) {
+    is.read(reinterpret_cast<char *>(&v), sizeof(T));
+    return static_cast<bool>(is);
+}
+
+static void slot_aux_put_buf(std::ostream & os, const std::vector<uint8_t> & b) {
+    const uint64_t n = b.size();
+    slot_aux_put(os, n);
+    if (n > 0) {
+        os.write(reinterpret_cast<const char *>(b.data()), n);
+    }
+}
+
+static bool slot_aux_get_buf(std::istream & is, std::vector<uint8_t> & b) {
+    uint64_t n = 0;
+    if (!slot_aux_get(is, n)) {
+        return false;
+    }
+    b.resize(n);
+    if (n > 0) {
+        is.read(reinterpret_cast<char *>(b.data()), n);
+    }
+    return static_cast<bool>(is);
+}
+
+static bool slot_aux_save(
+        const std::string & filepath,
+        llama_context * ctx_dft,
+        llama_seq_id seq_id,
+        const std::list<common_prompt_checkpoint> & checkpoints,
+        size_t & n_bytes) {
+    std::vector<uint8_t> dft;
+    if (ctx_dft != nullptr) {
+        const size_t size = llama_state_seq_get_size_ext(ctx_dft, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        dft.resize(size);
+        if (size > 0) {
+            llama_state_seq_get_data_ext(ctx_dft, dft.data(), size, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+    }
+
+    std::ofstream os(slot_aux_path(filepath), std::ios::binary | std::ios::trunc);
+    if (!os) {
+        return false;
+    }
+
+    os.write(SLOT_AUX_MAGIC, sizeof(SLOT_AUX_MAGIC));
+    slot_aux_put(os, SLOT_AUX_VERSION);
+    slot_aux_put_buf(os, dft);
+
+    const uint64_t n_ckpt = checkpoints.size();
+    slot_aux_put(os, n_ckpt);
+
+    for (const auto & ckpt : checkpoints) {
+        slot_aux_put(os, static_cast<int64_t>(ckpt.n_tokens));
+        slot_aux_put(os, static_cast<int32_t>(ckpt.id_task));
+        slot_aux_put(os, static_cast<int32_t>(ckpt.pos_min));
+        slot_aux_put(os, static_cast<int32_t>(ckpt.pos_max));
+        slot_aux_put_buf(os, ckpt.data_tgt);
+        slot_aux_put_buf(os, ckpt.data_dft);
+        slot_aux_put_buf(os, ckpt.data_spec);
+    }
+
+    os.flush();
+    if (!os) {
+        return false;
+    }
+
+    n_bytes = static_cast<size_t>(os.tellp());
+    return true;
+}
+
+static bool slot_aux_load(
+        const std::string & filepath,
+        llama_context * ctx_dft,
+        llama_seq_id seq_id,
+        std::list<common_prompt_checkpoint> & checkpoints) {
+    std::ifstream is(slot_aux_path(filepath), std::ios::binary);
+    if (!is) {
+        return false;
+    }
+
+    char magic[sizeof(SLOT_AUX_MAGIC)] = { 0 };
+    is.read(magic, sizeof(magic));
+    if (!is || std::memcmp(magic, SLOT_AUX_MAGIC, sizeof(magic)) != 0) {
+        return false;
+    }
+
+    uint32_t version = 0;
+    if (!slot_aux_get(is, version) || version != SLOT_AUX_VERSION) {
+        return false;
+    }
+
+    std::vector<uint8_t> dft;
+    if (!slot_aux_get_buf(is, dft)) {
+        return false;
+    }
+    if (!dft.empty()) {
+        if (ctx_dft == nullptr) {
+            return false;
+        }
+        if (llama_state_seq_set_data_ext(ctx_dft, dft.data(), dft.size(), seq_id, 0) != dft.size()) {
+            return false;
+        }
+    }
+
+    uint64_t n_ckpt = 0;
+    if (!slot_aux_get(is, n_ckpt)) {
+        return false;
+    }
+
+    std::list<common_prompt_checkpoint> restored;
+    for (uint64_t i = 0; i < n_ckpt; ++i) {
+        common_prompt_checkpoint ckpt;
+
+        int64_t n_tokens = 0;
+        int32_t id_task = 0, pos_min = 0, pos_max = 0;
+        if (!slot_aux_get(is, n_tokens) || !slot_aux_get(is, id_task) ||
+            !slot_aux_get(is, pos_min)  || !slot_aux_get(is, pos_max)) {
+            return false;
+        }
+        ckpt.n_tokens = n_tokens;
+        ckpt.id_task  = id_task;
+        ckpt.pos_min  = pos_min;
+        ckpt.pos_max  = pos_max;
+
+        if (!slot_aux_get_buf(is, ckpt.data_tgt) ||
+            !slot_aux_get_buf(is, ckpt.data_dft) ||
+            !slot_aux_get_buf(is, ckpt.data_spec)) {
+            return false;
+        }
+
+        restored.push_back(std::move(ckpt));
+    }
+
+    checkpoints = std::move(restored);
+    return true;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -2465,6 +2628,12 @@ private:
                         break;
                     }
 
+                    size_t n_aux = 0;
+                    if (!slot_aux_save(filepath, ctx_dft, slot->id, slot->prompt.checkpoints, n_aux)) {
+                        SLT_WRN(*slot, "%s", "failed to write slot sidecar; a restore from this file will reprocess the prompt in full\n");
+                        n_aux = 0;
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2474,7 +2643,7 @@ private:
                     res->filename = filename;
                     res->is_save  = true;
                     res->n_tokens = slot->prompt.tokens.size();
-                    res->n_bytes  = nwrite;
+                    res->n_bytes  = nwrite + n_aux;
                     res->t_ms     = t_save_ms;
                     queue_results.send(std::move(res));
                 } break;
@@ -2524,6 +2693,10 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        if (!slot_aux_load(filepath, ctx_dft, slot->id, slot->prompt.checkpoints)) {
+                            SLT_WRN(*slot, "%s", "no usable slot sidecar; the next request will reprocess the prompt in full\n");
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);

@@ -1,6 +1,10 @@
 #include "common.cuh"
 
-#define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.
+// Strix Halo (gfx1151): MMQ overtakes the mat-vec kernels well below batch 8 --
+// measured 185ms for a batch of 8 via MMVQ vs 109ms for 12 via MMQ on qwen35 27B.
+// A speculative verify block lands squarely in that window, so cap the mat-vec
+// path at 4 and let MMQ take 5..8.
+#define MMVF_MAX_BATCH_SIZE 4 // Max. batch size for which to use MMVF kernels.
 
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);

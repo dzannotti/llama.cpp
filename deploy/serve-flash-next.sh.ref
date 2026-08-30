@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# llama.cpp (our mimiron/flash-next fork in /srv/models/.work/fn-tree, ROCm build) serving Qwen3.8-Flash-Next with the
+# MTP draft sidecar and its own web UI. usage: tools/serve-llamacpp.sh [start|stop] [ctx]
+set -euo pipefail
+case "${1:-start}" in
+  start)
+    docker run -d --rm --name llamacpp-fn -p ${BIND:-0.0.0.0}:${PORT:-8090}:8090 --security-opt label=disable \
+      --device /dev/kfd --device /dev/dri --group-add 105 --group-add 39 --security-opt seccomp=unconfined --ipc host \
+      -e LLAMA_ATTN_ROT_DISABLE=1 -e LD_LIBRARY_PATH=/fn/build/bin:/opt/rocm/lib -e HSA_DISABLE_COREDUMP_ON_EXCEPTION=1 \
+      -v /srv/models/.work/fn-tree:/fn:ro -v /srv/models/qwen3.8-flash-next:/models/fn:ro mimiron/rocm:10.0.0 \
+      /fn/build/bin/llama-server --host 0.0.0.0 --port 8090 -ngl 999 -fit off -fa on \
+        -c ${2:-262144} --cache-type-k q8_0 --cache-type-v q8_0 -b 2048 -ub 2048 -np 1 \
+        --model /models/fn/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
+        -md /models/fn/mtp/Qwen3.8-Flash-Next-MTP-Q4_K_M.gguf -ngld 999 \
+        --spec-type draft-mtp --spec-draft-n-max 6 --spec-draft-p-min 0.75 \
+        --ngram-on-disk --ngram-io-threads 64 --no-warmup > /dev/null
+    echo started;;
+  stop) docker stop llamacpp-fn >/dev/null 2>&1 || true; echo stopped;;
+esac

@@ -499,18 +499,15 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
 
-        const int64_t n_tok = conv_input->ne[0] - conv_states->ne[0];
+        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
 
-        // slot s holds the conv state as of s tokens back. A batch with n_tok tokens defines
-        // slots 0..n_tok. Deeper slots keep their previous content: an earlier, larger batch
-        // may have written them, and a rollback that returns to that batch's position still
-        // reads them (test-recurrent-state-rollback). The old full-depth loop overwrote those
-        // slots with clamped duplicates of slot n_tok. The gated-delta-net snapshot write has
-        // the same bound.
-        const int64_t K = std::min<int64_t>((int64_t) cparams.n_rs_seq, n_tok) + 1;
+        // only the snapshot slots reachable by a rollback inside this batch are
+        // useful: rollback <= n_seq_tokens - 1, so slots beyond the batch repeat
+        // the pre-batch state and would only waste kernel launches per round
+        const int64_t t_min = std::max<int64_t>(1, K - ubatch.n_seq_tokens + 1);
 
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = n_tok - K + t;
+        for (int64_t t = t_min; t <= K; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
             const int64_t s_slot = K - t;
 
             ggml_tensor * conv_state_last =

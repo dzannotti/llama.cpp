@@ -4,7 +4,7 @@
 // measured 185ms for a batch of 8 via MMVQ vs 109ms for 12 via MMQ on qwen35 27B.
 // A speculative verify block lands squarely in that window, so cap the mat-vec
 // path at 4 and let MMQ take 5..8.
-#define MMVQ_MAX_BATCH_SIZE 2 // Max. batch size for which to use MMVQ kernels.
+#define MMVQ_MAX_BATCH_SIZE 4 // Max. batch size for which to use MMVQ kernels.
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 

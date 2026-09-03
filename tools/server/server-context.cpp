@@ -1,6 +1,7 @@
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
+#include "server-kv-disk.h"
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -298,6 +299,10 @@ struct server_slot {
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
+            return false;
+        }
+
+        if (!prompt_cache.ram_enabled) {
             return false;
         }
 
@@ -1351,17 +1356,40 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
+        // the on-disk tier works on its own, so the cache object is also needed when the RAM tier
+        // is switched off with `--cache-ram 0`
+        if (params_base.cache_ram_mib != 0 || !params_base.kv_cache_dir.empty()) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
-            } else {
+            } else if (params_base.cache_ram_mib > 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+            } else {
+                SRV_TRC("%s", "in-memory prompt cache is disabled\n");
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+
+        if (prompt_cache && !params_base.kv_cache_dir.empty()) {
+            // The fingerprint is bound to the model, so two models sharing a directory never collide.
+            // Keyed on the weights rather than on --alias: renaming an alias must not invalidate a
+            // cache, and two models sharing one must not be able to read each other's state.
+            char buf_desc[128] = {0};
+            llama_model_desc(model_tgt, buf_desc, sizeof(buf_desc));
+
+            const std::string model_tag = params_base.model.path + "|" + buf_desc;
+
+            prompt_cache->disk_min_tokens = (size_t) params_base.kv_cache_min_toks;
+
+            if (!prompt_cache->disk_init(params_base.kv_cache_dir, model_tag,
+                        1024ull*1024ull*(size_t) params_base.kv_cache_max_mib,
+                        (int64_t) params_base.kv_cache_ttl_s,
+                        mctx != nullptr)) {
+                SRV_WRN("%s", "on-disk KV cache could not be initialised, continuing without it\n");
+            }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1421,8 +1449,8 @@ private:
         metrics.init();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
+            if (params_base.cache_ram_mib == 0 && params_base.kv_cache_dir.empty()) {
+                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram or --kv-cache-dir, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
                 if (params_base.kv_unified) {
@@ -1664,6 +1692,14 @@ private:
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
+        }
+
+        // On-disk KV cache. The key is an exact sha1 of the conversation truncated at its last
+        // assistant message, so a hit means this slot now holds precisely the state the previous
+        // turn ended with, and only the new user message has to be prefilled. [TAG_KV_DISK_LOAD]
+        if (ret && prompt_cache && prompt_cache->disk_enabled() &&
+                task.type == SERVER_TASK_TYPE_COMPLETION && !task.params.kv_conv_key.empty()) {
+            prompt_cache->disk_load(ret->prompt, task.params.kv_conv_key, ret->ctx_tgt, ret->ctx_dft, ret->id);
         }
 
         return ret;
@@ -2117,6 +2153,30 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        // Persist the finished conversation while its KV is still in the slot, and before
+        // generated_text is moved into the response below. The key is this turn's conversation
+        // extended with the reply, which is exactly what the next turn will look itself up by.
+        // [TAG_KV_DISK_SAVE]
+        if (prompt_cache && prompt_cache->disk_enabled() && slot.task &&
+                !slot.task->is_child() && slot.stats.n_gen > 0 &&
+                !slot.task->params.kv_conv_base.empty()) {
+            sha1_state base;
+
+            if (sha1_state_from_hex(slot.task->params.kv_conv_base, base)) {
+                // hash the reply as the client will echo it back, i.e. without reasoning
+                std::string reply = slot.generated_text;
+                try {
+                    reply = common_chat_parse(slot.generated_text, false, slot.task->params.chat_parser_params).content;
+                } catch (const std::exception &) {
+                    // not a chat request, or unparseable: the raw text is the best key available
+                }
+
+                server_kv_add_message(base, "assistant", reply);
+
+                prompt_cache->disk_store(slot.prompt, sha1_hex(base), slot.ctx_tgt, slot.ctx_dft, slot.id);
+            }
+        }
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -4269,6 +4329,55 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
+// Build the on-disk KV cache keys for a chat request.
+//
+// The lookup key hashes the conversation truncated at its last assistant message, because that is
+// byte-identical to what the previous turn stored. Hashing the whole arriving conversation would
+// never hit: every request carries one more message than anything already saved.
+//
+// The base digest covers all arriving messages and is finished off with the reply once it exists,
+// producing the key this turn stores under - which is what the next turn will look up.
+static void kv_attach_conv_keys(const json & body, json & data) {
+    if (!body.contains("messages") || !body.at("messages").is_array()) {
+        return;
+    }
+
+    const auto & msgs = body.at("messages");
+
+    int i_last_assistant = -1;
+    for (size_t i = 0; i < msgs.size(); i++) {
+        if (json_value(msgs[i], "role", std::string()) == "assistant") {
+            i_last_assistant = (int) i;
+        }
+    }
+
+    sha1_state  s;
+    std::string key_load;
+
+    for (size_t i = 0; i < msgs.size(); i++) {
+        const std::string role = json_value(msgs[i], "role", std::string());
+
+        std::string content;
+        if (msgs[i].contains("content") && !msgs[i].at("content").is_null()) {
+            const auto & c = msgs[i].at("content");
+            content = c.is_string() ? c.get<std::string>() : c.dump();
+        }
+
+        server_kv_add_message(s, role, content);
+
+        if ((int) i == i_last_assistant) {
+            key_load = sha1_hex(s);
+        }
+    }
+
+    // no assistant message yet means a first turn: nothing can have been stored for it
+    if (!key_load.empty()) {
+        data["__kv_conv_key"] = key_load;
+    }
+
+    data["__kv_conv_base"] = sha1_state_to_hex(s);
+}
+
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
             server_task_type type,
@@ -4337,6 +4446,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
+
+            // on-disk KV cache keys, computed by the chat route where the messages are still visible
+            task.params.kv_conv_key  = json_value(data, "__kv_conv_key",  std::string());
+            task.params.kv_conv_base = json_value(data, "__kv_conv_base", std::string());
 
             // OAI-compat
             task.params.res_type          = res_type;
@@ -4950,6 +5063,7 @@ void server_routes::init_routes() {
             body,
             meta->chat_params,
             files);
+        kv_attach_conv_keys(body, body_parsed);
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,

@@ -3094,6 +3094,24 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // speculation pays off for a single stream, but at batch > 1 the verify cost is not
+        // paid back, and draft-mtp is known to misbehave with parallel slots. count the slots
+        // that generate now and skip drafting when there are too many of them.
+        bool spec_allowed = true;
+        if (spec && params_base.speculative.max_concurrency > 0) {
+            int n_gen = 0;
+            for (const auto & slot : slots) {
+                if (slot.state == SLOT_STATE_GENERATING) {
+                    n_gen++;
+                }
+            }
+            spec_allowed = n_gen <= params_base.speculative.max_concurrency;
+            if (!spec_allowed) {
+                SRV_DBG("skipping draft, %d slots generate at once (--spec-max-concurrency %d)\n",
+                        n_gen, params_base.speculative.max_concurrency);
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3111,6 +3129,10 @@ private:
 
             if (spec) {
                 common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+
+                if (!spec_allowed) {
+                    return;
+                }
 
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;

@@ -391,6 +391,10 @@ struct common_params_speculative_ngram_cache {
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
+    // skip drafting when more than this many slots generate at once (0 = no limit)
+    // speculation helps a single stream, but at batch > 1 the verify cost is not paid back
+    int32_t max_concurrency = 0;
+
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
